@@ -2,15 +2,20 @@
 --   love .                         play; F9 toggles recording
 --   love . --selftest [audio]      record 3 s automatically and quit
 --                                  (audio = auto | loopback | events | none)
+--   love . --selftest auto --slow  the same, with frames slower than real
+--                                  time (checks the audio stays in sync)
+--   ... --encoder auto             try a hardware encoder (nvenc / amf / qsv)
 local recorder = require("recorder")
 
 local balls, blip, hum = {}, nil, nil
 local t = 0
-local selftest, selfAudio
+local selftest, selfAudio, slow, encoder
 
 function love.load(args)
     for i, a in ipairs(args or {}) do
         if a == "--selftest" then selftest = true; selfAudio = args[i + 1] end
+        if a == "--slow" then slow = true end
+        if a == "--encoder" then encoder = args[i + 1] end
     end
     love.graphics.setBackgroundColor(0.08, 0.09, 0.16)
     blip = love.audio.newSource("example/sounds/blip.wav", "static")
@@ -22,7 +27,7 @@ function love.load(args)
         balls[i] = { x = 100 + i * 90, y = 80 + i * 30, vx = 220 + i * 25, vy = 0, r = 14 + i * 2,
                      c = { 0.4 + i * 0.1, 0.8 - i * 0.08, 1 } }
     end
-    recorder.attach({ audio = selfAudio or "auto" })
+    recorder.attach({ audio = selfAudio or "auto", encoder = encoder })
     if selftest then recorder.start(love.graphics.newCanvas(love.graphics.getDimensions()), "selftest") end
 end
 
@@ -51,6 +56,7 @@ function love.update(dt)
 end
 
 function love.draw()
+    if slow and recorder.active then love.timer.sleep(0.03) end   -- ~33 fps of 60
     for _, b in ipairs(balls) do
         love.graphics.setColor(b.c)
         love.graphics.circle("fill", b.x, b.y, b.r)

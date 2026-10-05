@@ -69,11 +69,11 @@ If such a script drives frames itself (calling `love.update` / `love.draw` in a 
 | key | default | meaning |
 |---|---|---|
 | `fps` | `60` | video frame rate and fixed simulation step |
-| `audio` | `"auto"` | `"auto"`, `"loopback"`, `"events"` or `"none"`. `"auto"` uses loopback when the recording kept real time and the event re-mix otherwise |
+| `audio` | `"auto"` | `"auto"`, `"loopback"`, `"events"` or `"none"`. `"auto"` uses loopback when it is available and the event re-mix otherwise |
 | `ffmpeg` | `"ffmpeg"` | ffmpeg executable (`FFMPEG` env var also works) |
-| `crf`, `preset` | `18`, `"veryfast"` | x264 quality / speed |
+| `encoder` | `"libx264"` | `"libx264"`, `"auto"` (first working of `h264_nvenc`, `h264_amf`, `h264_qsv`, else libx264) or an encoder name |
+| `crf`, `preset` | `18`, `"veryfast"` | x264 quality / speed (hardware encoders use matching presets) |
 | `outDir` | `"recordings"` | output folder inside the save directory |
-| `maxDrift` | `0.1` | loopback is used only if the wall clock ended within this many seconds of video time; otherwise the event re-mix (always in sync) is used |
 | `latency` | `0.09` | output latency (s) assumed when it can't be measured |
 | `key` | `"f9"` | toggle key for `attach()` (`nil` disables it) |
 | `pace` | `true` | sleep while recording so the game never runs faster than real time |
@@ -84,12 +84,14 @@ If such a script drives frames itself (calling `love.update` / `love.draw` in a 
 
 | mode | what you get | limits |
 |---|---|---|
-| **loopback** | Exactly what the game played: mixing, effects and volume changes included | Windows 10 2004+. The game must keep up with real time while recording (`maxDrift`) |
+| **loopback** | Exactly what the game played: mixing, effects and volume changes included. Stays in sync even when the game falls behind real time (see below) | Windows 10 2004+. Stretches where the game ran slow are squeezed back, so their pitch rises slightly |
 | **events** | A re-mix of every tracked Source on the video clock, frame-exact even if encoding made the game lag | Only Sources created from files (`love.audio.newSource(path, ...)`). Procedural audio (SoundData / queueable sources) is not re-mixed |
+
+Sync: every captured frame's wall-clock time is logged. On stop the capture is resampled onto the video clock, so the sample under video time *t* comes from the wall time at which that frame was made. Where the game kept real time this is a plain shift. Where it fell behind (heavy scenes, slow encoding), that stretch is squeezed back onto its frames instead of pushing all later audio out of sync.
 
 Latency: `loopback.exe` stamps the QueryPerformanceCounter time of its first sample. That stamp places the WAV on the video clock. The remaining offset is the device output latency (usually 50–150 ms). It is measured by cross-correlating the loopback track with the event re-mix and then removed. In testing, the residual offset was under 1 ms.
 
-The recorder writes a status line like `done|.../clip.mp4|180|loopback, latency 96 ms (measured, r=0.80)`.
+The recorder writes a status line like `done|.../clip.mp4|180|loopback synced (wall +0.00 s), latency 93 ms (measured, r=0.78), libx264`. `wall` is how far real time ran ahead of video time over the clip. The demo's `--selftest auto --slow` records at about half speed to check the sync (`wall +3.07 s` over a 3 s clip, latency still measured).
 
 ## Demo
 

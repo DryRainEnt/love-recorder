@@ -28,11 +28,33 @@ local function q(s) return '"' .. s .. '"' end
 local isWin = package.config:sub(1, 1) == "\\"
 local function sh(cmd) return isWin and ('"' .. cmd .. '"') or cmd end   -- cmd.exe quoting
 
+------------------------------------------------------------
+-- Encoder
+------------------------------------------------------------
+local ENC_ARGS = {
+    h264_nvenc = "-c:v h264_nvenc -preset p5 -rc vbr -cq 19 -b:v 0",
+    h264_amf   = "-c:v h264_amf -usage transcoding -quality quality -rc cqp -qp_i 18 -qp_p 18 -qp_b 20",
+    h264_qsv   = "-c:v h264_qsv -global_quality 20",
+}
+local function encoderWorks(enc)
+    local cmd = q(cfg.ffmpeg) .. " -hide_banner -loglevel error -f lavfi -i color=c=black:s=256x256:r=30:d=0.2" ..
+        " -pix_fmt yuv420p " .. ENC_ARGS[enc] .. " -f null - " .. (isWin and ">NUL 2>&1" or ">/dev/null 2>&1")
+    local r = os.execute(sh(cmd))
+    return r == 0 or r == true
+end
+local encoder = cfg.encoder or "libx264"
+if encoder == "auto" then
+    encoder = "libx264"
+    for _, e in ipairs({ "h264_nvenc", "h264_amf", "h264_qsv" }) do
+        if encoderWorks(e) then encoder = e; break end
+    end
+end
+local vargs = ENC_ARGS[encoder] or ("-c:v libx264 -preset " .. cfg.preset .. " -crf " .. cfg.crf)
+
 local videoPath = cfg.dir .. "/" .. cfg.name .. "_video.mp4"
 local pipe = io.popen(sh(q(cfg.ffmpeg) ..
     " -y -loglevel error -f rawvideo -pix_fmt rgba -s " .. cfg.w .. "x" .. cfg.h ..
-    " -r " .. cfg.fps .. " -i - -c:v libx264 -preset " .. cfg.preset .. " -crf " .. cfg.crf ..
-    " -pix_fmt yuv420p " .. q(videoPath)), isWin and "wb" or "w")
+    " -r " .. cfg.fps .. " -i - -pix_fmt yuv420p " .. vargs .. " " .. q(videoPath)), isWin and "wb" or "w")
 if not pipe then outCh:push("error|ffmpeg could not be started (" .. cfg.ffmpeg .. ")"); return end
 
 local frames, stop = 0, nil
@@ -152,18 +174,34 @@ local function envFromWav(path)
     return env, n, data   -- keep data alive while env is used
 end
 
--- best latency (ms, 0..maxLag) so that loopback[k - off + lat] matches events[k]
-local function measureLatency(evEnv, evN, lbEnv, lbN, offMs, maxLag)
+------------------------------------------------------------
+-- Video clock -> wall clock (frame capture stamps, piecewise linear)
+------------------------------------------------------------
+local wall, wallN = {}, 0
+for v in (stop.frameWall or ""):gmatch("[^,]+") do wallN = wallN + 1; wall[wallN] = tonumber(v) end
+local function wallAt(tv)
+    if wallN < 2 then return tv end
+    local f = tv * cfg.fps
+    local i = math.floor(f)
+    if i < 0 then return wall[1] + tv end
+    if i >= wallN - 1 then return wall[wallN] + (tv - (wallN - 1) / cfg.fps) end
+    local a = wall[i + 1]
+    return a + (wall[i + 2] - a) * (f - i)
+end
+
+-- best latency (ms, 0..maxLag): loopback ms index for video ms k is
+-- base[k] + lat; compared every `step` ms
+local function measureLatency(evEnv, evN, lbEnv, lbN, base, maxLag, step)
     local function mean(e, n) local s = 0 for i = 0, n - 1 do s = s + e[i] end return s / math.max(1, n) end
     local me, ml = mean(evEnv, evN), mean(lbEnv, lbN)
     local best, bestLat = -1e9, 0
     local ve = 0
-    for k = 0, evN - 1 do ve = ve + (evEnv[k] - me) ^ 2 end
+    for k = 0, evN - 1, step do ve = ve + (evEnv[k] - me) ^ 2 end
     local bestNorm = 0
     for lat = 0, maxLag do
         local s, vl = 0, 0
-        for k = 0, evN - 1 do
-            local j = k - offMs + lat
+        for k = 0, evN - 1, step do
+            local j = base[k] + lat
             if j >= 0 and j < lbN then
                 local d = lbEnv[j] - ml
                 s = s + (evEnv[k] - me) * d
@@ -176,6 +214,28 @@ local function measureLatency(evEnv, evN, lbEnv, lbN, offMs, maxLag)
         end
     end
     return bestLat, bestNorm
+end
+
+-- The loopback capture resampled onto the video clock: output sample at
+-- video time t reads the capture at wall time wallAt(t) + latency. Where the
+-- game kept real time this is a plain shift; where it fell behind, that
+-- stretch of audio is squeezed back to the frames it belongs to.
+local function warpLoopback(data, offset0, latency)
+    local bytes = #data - 44
+    local src = ffi.cast("const int16_t*", ffi.cast("const char*", data) + 44)
+    local srcN = math.floor(bytes / 4)
+    local total = math.max(1, math.floor(duration * RATE))
+    local out = ffi.new("float[?]", total * 2)
+    for o = 0, total - 1 do
+        local p = (wallAt(o / RATE) + latency - offset0) * RATE
+        local i0 = math.floor(p)
+        if i0 >= 0 and i0 + 1 < srcN then
+            local fr = p - i0
+            out[o * 2] = (src[i0 * 2] * (1 - fr) + src[i0 * 2 + 2] * fr) / 32768
+            out[o * 2 + 1] = (src[i0 * 2 + 1] * (1 - fr) + src[i0 * 2 + 3] * fr) / 32768
+        end
+    end
+    return out, total
 end
 
 ------------------------------------------------------------
@@ -195,27 +255,28 @@ end
 if stop.audio == "loopback" then
     local lbStart = waitStart(stop.wav)
     if lbStart and exists(stop.wav) then
-        audioPath = stop.wav
-        local offset0 = lbStart - stop.startQpc       -- first sample on the video clock
+        local offset0 = lbStart - stop.startQpc       -- first sample, wall clock from start
         local latency, how = cfg.latency or 0.09, "default"
+        local lbEnv, lbN, data = envFromWav(stop.wav)
         local mix, total = buildMix(stop.events)
-        if mix then
+        if mix and lbEnv then
             local evEnv, evN = envFromMix(mix, total)
-            local lbEnv, lbN, keep = envFromWav(stop.wav)
-            if lbEnv then
-                local lat, corr = measureLatency(evEnv, evN, lbEnv, lbN,
-                    math.floor(offset0 * 1000 + 0.5), 400)
-                if corr >= 0.5 then latency, how = lat / 1000, string.format("measured, r=%.2f", corr) end
-            end
-            keep = nil
+            local base = ffi.new("int32_t[?]", evN + 1)
+            for k = 0, evN - 1 do base[k] = math.floor((wallAt(k / 1000) - offset0) * 1000 + 0.5) end
+            local lat, corr = measureLatency(evEnv, evN, lbEnv, lbN, base, 400, 2)
+            if corr >= 0.5 then latency, how = lat / 1000, string.format("measured, r=%.2f", corr) end
         end
-        local offset = offset0 - latency
-        note = string.format("loopback, latency %d ms (%s)", math.floor(latency * 1000 + 0.5), how)
-        if offset >= 0 then
-            audioFilter = string.format("adelay=%d:all=1,apad", math.floor(offset * 1000 + 0.5))
+        if data then
+            local out, outN = warpLoopback(data, offset0, latency)
+            audioPath = cfg.dir .. "/" .. cfg.name .. "_synced.wav"
+            writeWav(audioPath, out, outN)
+            audioFilter = "apad"
+            note = string.format("loopback synced (wall %+.2f s), latency %d ms (%s)",
+                stop.drift or 0, math.floor(latency * 1000 + 0.5), how)
         else
-            audioFilter = string.format("atrim=start=%.4f,asetpts=PTS-STARTPTS,apad", -offset)
+            note = "loopback empty, no audio"
         end
+        if not cfg.keepAudio then os.remove(stop.wav); os.remove(stop.wav .. ".start") end
     else
         note = "loopback failed, no audio"
     end
@@ -253,7 +314,7 @@ if ok == 0 or ok == true then
     if audioPath and not cfg.keepAudio then
         os.remove(audioPath); os.remove(audioPath .. ".start")
     end
-    outCh:push("done|" .. outPath .. "|" .. frames .. "|" .. note)
+    outCh:push("done|" .. outPath .. "|" .. frames .. "|" .. note .. ", " .. encoder)
 else
     outCh:push("error|mux failed (video kept at " .. videoPath .. ")")
 end

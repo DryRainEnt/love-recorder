@@ -12,12 +12,14 @@
 -- Audio (in order of preference):
 --   "loopback" Windows 10 2004+: bin/loopback.exe records exactly what this
 --              process plays (WASAPI process loopback, like OBS Application
---              Audio Capture). Used when the recording kept real time.
+--              Audio Capture). Every frame's wall-clock time is logged, and
+--              on stop the capture is warped onto the video clock, so it
+--              stays in sync even where the game fell behind real time.
 --   "events"   every love.audio Source is tracked (play / stop / pause /
 --              seek / volume / pitch / looping / master volume) and the same
---              files are re-mixed on the video clock. Frame-exact even when
---              encoding made the game lag; only file-based sources.
---   "auto"     loopback when possible, events otherwise (default).
+--              files are re-mixed on the video clock (only file-based
+--              sources). Also used to measure the loopback latency.
+--   "auto"     loopback when available, events otherwise (default).
 -- Needs ffmpeg on PATH (or config.ffmpeg / the FFMPEG environment variable).
 -- MIT License.
 ------------------------------------------------------------
@@ -30,12 +32,11 @@ R.config = {
     fps = 60,
     audio = "auto",          -- "auto" | "loopback" | "events" | "none"
     ffmpeg = os.getenv("FFMPEG") or "ffmpeg",
-    crf = 18,
+    encoder = "libx264",     -- "libx264" | "auto" (first working of h264_nvenc / h264_amf /
+                             -- h264_qsv, else libx264) | an encoder name
+    crf = 18,                -- libx264 quality (hardware encoders use their own equivalents)
     preset = "veryfast",
     outDir = "recordings",   -- inside the save directory
-    maxDrift = 0.1,          -- loopback only if video and wall clock ended within 0.1 s
-                             -- (a paced recording that fell behind real time has
-                             -- stretched audio; the event re-mix stays in sync)
     key = "f9",              -- attach(): toggle key (nil = none)
     trackAudio = true,       -- track Sources for the "events" fallback
     pace = true,             -- never run faster than real time while recording
@@ -47,6 +48,7 @@ R.active, R.busy, R.message = false, false, nil
 
 local thread, inCh, outCh
 local frame, startQpc, startTime = 0, 0, 0
+local frameWall = {}     -- wall-clock seconds (from start) at which each frame was captured
 local lbWav, lbExe
 
 ------------------------------------------------------------
@@ -264,9 +266,9 @@ function R.start(canvas, name)
     thread = love.thread.newThread(DIR .. "/worker.lua")
     thread:start()
     inCh:push({ dir = dir, name = name, w = w, h = h, fps = cfg.fps, ffmpeg = cfg.ffmpeg,
-                crf = cfg.crf, preset = cfg.preset, latency = cfg.latency })
+                crf = cfg.crf, preset = cfg.preset, encoder = cfg.encoder, latency = cfg.latency })
 
-    frame, events = 0, {}
+    frame, events, frameWall = 0, {}, {}
     R.active, R.message = true, nil
     openPlaying()
     startQpc, startTime = qpcNow(), love.timer.getTime()
@@ -301,6 +303,7 @@ function R.capture(canvas)
     -- handle right away: the GC can't see the 8 MB behind each ImageData, so
     -- leaving it to the collector piles up gigabytes on a long recording.
     local img = canvas:newImageData()
+    frameWall[frame + 1] = string.format("%.5f", qpcNow() - startQpc)
     inCh:supply(img)
     img:release()
     frame = frame + 1
@@ -314,9 +317,7 @@ function R.stop(wait)
     for _, ev in ipairs(events) do if not ev.t1 then ev.t1 = vt end end
     for _, st in pairs(tracked) do st.ev = nil end
 
-    local real = qpcNow() - startQpc
-    local drift = math.abs(real - vt)                 -- seconds the wall clock ran ahead
-    local lag = vt > 0 and drift / vt or 0
+    local drift = (qpcNow() - startQpc) - vt         -- seconds the wall clock ran ahead
     local msg = { stop = true, startQpc = startQpc, duration = vt }
     if lbWav then
         local f = io.open(lbWav .. ".stop", "w"); if f then f:close() end
@@ -327,13 +328,14 @@ function R.stop(wait)
             ev.loop and 1 or 0, ev.offset }, "\t")
     end
     msg.events = table.concat(lines, "\n")   -- also used to measure loopback latency
-    if lbWav and (cfg.audio == "loopback" or drift <= cfg.maxDrift) then
+    msg.frameWall = table.concat(frameWall, ",")
+    msg.drift = drift
+    if lbWav then
         msg.audio, msg.wav = "loopback", lbWav:gsub("\\", "/")
         msg.note = "loopback"
     elseif cfg.audio ~= "none" and #events > 0 then
         msg.audio = "events"
-        msg.note = lbWav and string.format("events (wall clock %.1f s ahead, %.1f%%)", drift, lag * 100) or "events"
-        msg.dropWav = lbWav and lbWav:gsub("\\", "/") or nil
+        msg.note = "events"
     else
         msg.audio, msg.note = "none", "no audio"
     end
