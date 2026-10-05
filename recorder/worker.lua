@@ -175,18 +175,41 @@ local function envFromWav(path)
 end
 
 ------------------------------------------------------------
--- Video clock -> wall clock (frame capture stamps, piecewise linear)
+-- Video clock -> wall clock
 ------------------------------------------------------------
+-- Each frame's capture time jitters by milliseconds (pacing sleeps, GPU
+-- readback); following that frame by frame would wobble the pitch every
+-- 16 ms. Only the slow trend matters: the drift (wall - video) is averaged
+-- over DRIFT_WINDOW seconds. If it never moves more than STEADY from its
+-- median, the game kept real time: the capture is just shifted, sample for
+-- sample, untouched. Otherwise the smoothed drift is followed, so stretches
+-- where the game fell behind are eased back onto their frames.
+local DRIFT_WINDOW, STEADY = cfg.driftWindow or 1.0, 0.03
 local wall, wallN = {}, 0
 for v in (stop.frameWall or ""):gmatch("[^,]+") do wallN = wallN + 1; wall[wallN] = tonumber(v) end
+local drift, steady, shift = {}, true, 0
+if wallN >= 2 then
+    local raw, sorted = {}, {}
+    for i = 1, wallN do raw[i] = wall[i] - (i - 1) / cfg.fps; sorted[i] = raw[i] end
+    table.sort(sorted)
+    shift = sorted[math.floor(wallN / 2) + 1]
+    local k = math.max(1, math.floor(DRIFT_WINDOW * cfg.fps / 2))
+    local pre = { [0] = 0 }
+    for i = 1, wallN do pre[i] = pre[i - 1] + raw[i] end
+    for i = 1, wallN do
+        local a, b = math.max(1, i - k), math.min(wallN, i + k)
+        drift[i] = (pre[b] - pre[a - 1]) / (b - a + 1)
+        if math.abs(drift[i] - shift) > STEADY then steady = false end
+    end
+end
 local function wallAt(tv)
-    if wallN < 2 then return tv end
+    if steady or wallN < 2 then return tv + shift end
     local f = tv * cfg.fps
     local i = math.floor(f)
-    if i < 0 then return wall[1] + tv end
-    if i >= wallN - 1 then return wall[wallN] + (tv - (wallN - 1) / cfg.fps) end
-    local a = wall[i + 1]
-    return a + (wall[i + 2] - a) * (f - i)
+    if i < 0 then return tv + drift[1] end
+    if i >= wallN - 1 then return tv + drift[wallN] end
+    local a = drift[i + 1]
+    return tv + a + (drift[i + 2] - a) * (f - i)
 end
 
 -- best latency (ms, 0..maxLag): loopback ms index for video ms k is
@@ -226,6 +249,18 @@ local function warpLoopback(data, offset0, latency)
     local srcN = math.floor(bytes / 4)
     local total = math.max(1, math.floor(duration * RATE))
     local out = ffi.new("float[?]", total * 2)
+    if steady then
+        -- kept real time: a plain sample-exact shift, no resampling
+        local d = math.floor((shift + latency - offset0) * RATE + 0.5)
+        for o = 0, total - 1 do
+            local i = o + d
+            if i >= 0 and i < srcN then
+                out[o * 2] = src[i * 2] / 32768
+                out[o * 2 + 1] = src[i * 2 + 1] / 32768
+            end
+        end
+        return out, total
+    end
     for o = 0, total - 1 do
         local p = (wallAt(o / RATE) + latency - offset0) * RATE
         local i0 = math.floor(p)
@@ -271,8 +306,8 @@ if stop.audio == "loopback" then
             audioPath = cfg.dir .. "/" .. cfg.name .. "_synced.wav"
             writeWav(audioPath, out, outN)
             audioFilter = "apad"
-            note = string.format("loopback synced (wall %+.2f s), latency %d ms (%s)",
-                stop.drift or 0, math.floor(latency * 1000 + 0.5), how)
+            note = string.format("loopback %s (wall %+.2f s), latency %d ms (%s)",
+                steady and "shifted" or "warped", stop.drift or 0, math.floor(latency * 1000 + 0.5), how)
         else
             note = "loopback empty, no audio"
         end

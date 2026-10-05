@@ -9,13 +9,14 @@ local recorder = require("recorder")
 
 local balls, blip, hum = {}, nil, nil
 local t = 0
-local selftest, selfAudio, slow, encoder
+local selftest, selfAudio, slow, encoder, window
 
 function love.load(args)
     for i, a in ipairs(args or {}) do
         if a == "--selftest" then selftest = true; selfAudio = args[i + 1] end
         if a == "--slow" then slow = true end
         if a == "--encoder" then encoder = args[i + 1] end
+        if a == "--window" then window = tonumber(args[i + 1]) end
     end
     love.graphics.setBackgroundColor(0.08, 0.09, 0.16)
     blip = love.audio.newSource("example/sounds/blip.wav", "static")
@@ -27,7 +28,7 @@ function love.load(args)
         balls[i] = { x = 100 + i * 90, y = 80 + i * 30, vx = 220 + i * 25, vy = 0, r = 14 + i * 2,
                      c = { 0.4 + i * 0.1, 0.8 - i * 0.08, 1 } }
     end
-    recorder.attach({ audio = selfAudio or "auto", encoder = encoder })
+    recorder.attach({ audio = selfAudio or "auto", encoder = encoder, driftWindow = window })
     if selftest then recorder.start(love.graphics.newCanvas(love.graphics.getDimensions()), "selftest") end
 end
 

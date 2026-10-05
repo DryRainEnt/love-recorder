@@ -266,7 +266,8 @@ function R.start(canvas, name)
     thread = love.thread.newThread(DIR .. "/worker.lua")
     thread:start()
     inCh:push({ dir = dir, name = name, w = w, h = h, fps = cfg.fps, ffmpeg = cfg.ffmpeg,
-                crf = cfg.crf, preset = cfg.preset, encoder = cfg.encoder, latency = cfg.latency })
+                crf = cfg.crf, preset = cfg.preset, encoder = cfg.encoder, latency = cfg.latency,
+                driftWindow = cfg.driftWindow })
 
     frame, events, frameWall = 0, {}, {}
     R.active, R.message = true, nil
