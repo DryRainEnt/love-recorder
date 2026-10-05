@@ -238,11 +238,11 @@ local function loopbackExe()
     local data = love.filesystem.read(DIR .. "/bin/loopback.exe")
     if not data then return nil end
     love.filesystem.createDirectory("recorder_bin")
-    -- refresh the copy whenever its bytes differ (a rebuild can keep the size)
-    if love.filesystem.read("recorder_bin/loopback.exe") ~= data then
-        love.filesystem.write("recorder_bin/loopback.exe", data)
-    end
-    lbExe = (love.filesystem.getSaveDirectory() .. "/recorder_bin/loopback.exe"):gsub("/", "\\")
+    -- named after its content: a new build never collides with an old copy
+    -- that a stray process might still hold open
+    local name = "recorder_bin/loopback_" .. love.data.encode("string", "hex", love.data.hash("md5", data)):sub(1, 10) .. ".exe"
+    if love.filesystem.read(name) ~= data then love.filesystem.write(name, data) end
+    lbExe = (love.filesystem.getSaveDirectory() .. "/" .. name):gsub("/", "\\")
     return lbExe
 end
 

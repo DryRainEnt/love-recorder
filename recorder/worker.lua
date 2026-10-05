@@ -30,7 +30,7 @@ local function sh(cmd) return isWin and ('"' .. cmd .. '"') or cmd end   -- cmd.
 ------------------------------------------------------------
 local ENC_ARGS = {
     h264_nvenc = "-c:v h264_nvenc -preset p5 -rc vbr -cq 19 -b:v 0",
-    h264_amf   = "-c:v h264_amf -usage transcoding -quality quality -rc cqp -qp_i 18 -qp_p 18 -qp_b 20",
+    h264_amf   = "-c:v h264_amf -usage transcoding -quality quality -rc cqp -qp_i 20 -qp_p 22 -qp_b 24",
     h264_qsv   = "-c:v h264_qsv -global_quality 20",
 }
 local function encoderWorks(enc)

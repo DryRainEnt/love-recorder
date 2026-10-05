@@ -6,8 +6,8 @@
 // API as OBS "Application Audio Capture". Records 48 kHz 32-bit float stereo
 // (the Windows mix format, so normally no conversion at all; when the device
 // runs at another rate the engine converts with its high-quality resampler)
-// until a line arrives on stdin or <out.wav>.stop appears, then finalises
-// the WAV.
+// until a line arrives on stdin, <out.wav>.stop appears or the target
+// process exits, then finalises the WAV.
 //
 // Next to the WAV it writes <out.wav>.start containing the QueryPerformance-
 // Counter time (seconds) of the first recorded sample, so a caller can line
@@ -137,10 +137,15 @@ int wmain(int argc, wchar_t** argv) {
     wchar_t stopPath[MAX_PATH];
     swprintf(stopPath, MAX_PATH, L"%s.stop", outPath);
     DeleteFileW(stopPath);
-    HANDLE waits[2] = { g_stop, ready };
+    // also stop when the target process exits (a killed game must not leave
+    // this recorder running, capturing and holding its exe locked)
+    HANDLE target = OpenProcess(SYNCHRONIZE, FALSE, pid);
+    HANDLE waits[3] = { g_stop, ready, target };
+    DWORD nWaits = target ? 3 : 2;
     for (;;) {
-        DWORD w = WaitForMultipleObjects(2, waits, FALSE, 50);
+        DWORD w = WaitForMultipleObjects(nWaits, waits, FALSE, 50);
         if (w == WAIT_OBJECT_0) break;
+        if (target && w == WAIT_OBJECT_0 + 2) break;
         if (GetFileAttributesW(stopPath) != INVALID_FILE_ATTRIBUTES) { DeleteFileW(stopPath); break; }
         UINT32 packet = 0;
         while (SUCCEEDED(capture->GetNextPacketSize(&packet)) && packet > 0) {
