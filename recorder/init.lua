@@ -295,8 +295,12 @@ end
 -- Call once per frame with the finished canvas (before window overlays)
 function R.capture(canvas)
     if not R.active then return end
-    -- supply() waits for the worker: frames are never dropped
-    inCh:supply(canvas:newImageData())
+    -- supply() waits for the worker: frames are never dropped. Release our
+    -- handle right away: the GC can't see the 8 MB behind each ImageData, so
+    -- leaving it to the collector piles up gigabytes on a long recording.
+    local img = canvas:newImageData()
+    inCh:supply(img)
+    img:release()
     frame = frame + 1
 end
 
