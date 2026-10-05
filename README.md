@@ -60,6 +60,8 @@ recorder.stop(true)                      -- waits and returns "done|<path>|<fram
 
 Scripted captures (automated trailers) also work. Call `recorder.capture()` once per simulated frame and `recorder.stop(true)` at the end.
 
+If such a script drives frames itself (calling `love.update` / `love.draw` in a loop instead of `love.run`), end each frame with `love.graphics.present()` as `love.run` does. Without it the graphics driver keeps queueing every frame's commands and memory climbs by gigabytes over a long capture.
+
 ## Configuration
 
 `recorder.setup{...}` or `recorder.attach{...}`:
@@ -71,7 +73,7 @@ Scripted captures (automated trailers) also work. Call `recorder.capture()` once
 | `ffmpeg` | `"ffmpeg"` | ffmpeg executable (`FFMPEG` env var also works) |
 | `crf`, `preset` | `18`, `"veryfast"` | x264 quality / speed |
 | `outDir` | `"recordings"` | output folder inside the save directory |
-| `maxLag` | `0.03` | loopback is used only if real time stayed within this fraction of video time |
+| `maxDrift` | `0.1` | loopback is used only if the wall clock ended within this many seconds of video time; otherwise the event re-mix (always in sync) is used |
 | `latency` | `0.09` | output latency (s) assumed when it can't be measured |
 | `key` | `"f9"` | toggle key for `attach()` (`nil` disables it) |
 | `pace` | `true` | sleep while recording so the game never runs faster than real time |
@@ -82,7 +84,7 @@ Scripted captures (automated trailers) also work. Call `recorder.capture()` once
 
 | mode | what you get | limits |
 |---|---|---|
-| **loopback** | Exactly what the game played: mixing, effects and volume changes included | Windows 10 2004+. The game must keep up with real time while recording (`maxLag`) |
+| **loopback** | Exactly what the game played: mixing, effects and volume changes included | Windows 10 2004+. The game must keep up with real time while recording (`maxDrift`) |
 | **events** | A re-mix of every tracked Source on the video clock, frame-exact even if encoding made the game lag | Only Sources created from files (`love.audio.newSource(path, ...)`). Procedural audio (SoundData / queueable sources) is not re-mixed |
 
 Latency: `loopback.exe` stamps the QueryPerformanceCounter time of its first sample. That stamp places the WAV on the video clock. The remaining offset is the device output latency (usually 50–150 ms). It is measured by cross-correlating the loopback track with the event re-mix and then removed. In testing, the residual offset was under 1 ms.

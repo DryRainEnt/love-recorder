@@ -33,7 +33,9 @@ R.config = {
     crf = 18,
     preset = "veryfast",
     outDir = "recordings",   -- inside the save directory
-    maxLag = 0.03,           -- loopback only if real time stayed within 3%
+    maxDrift = 0.1,          -- loopback only if video and wall clock ended within 0.1 s
+                             -- (a paced recording that fell behind real time has
+                             -- stretched audio; the event re-mix stays in sync)
     key = "f9",              -- attach(): toggle key (nil = none)
     trackAudio = true,       -- track Sources for the "events" fallback
     pace = true,             -- never run faster than real time while recording
@@ -313,7 +315,8 @@ function R.stop(wait)
     for _, st in pairs(tracked) do st.ev = nil end
 
     local real = qpcNow() - startQpc
-    local lag = vt > 0 and math.abs(real / vt - 1) or 0
+    local drift = math.abs(real - vt)                 -- seconds the wall clock ran ahead
+    local lag = vt > 0 and drift / vt or 0
     local msg = { stop = true, startQpc = startQpc, duration = vt }
     if lbWav then
         local f = io.open(lbWav .. ".stop", "w"); if f then f:close() end
@@ -324,12 +327,12 @@ function R.stop(wait)
             ev.loop and 1 or 0, ev.offset }, "\t")
     end
     msg.events = table.concat(lines, "\n")   -- also used to measure loopback latency
-    if lbWav and (cfg.audio == "loopback" or lag <= cfg.maxLag) then
+    if lbWav and (cfg.audio == "loopback" or drift <= cfg.maxDrift) then
         msg.audio, msg.wav = "loopback", lbWav:gsub("\\", "/")
         msg.note = "loopback"
     elseif cfg.audio ~= "none" and #events > 0 then
         msg.audio = "events"
-        msg.note = lbWav and string.format("events (lagged %.0f%%)", lag * 100) or "events"
+        msg.note = lbWav and string.format("events (wall clock %.1f s ahead, %.1f%%)", drift, lag * 100) or "events"
         msg.dropWav = lbWav and lbWav:gsub("\\", "/") or nil
     else
         msg.audio, msg.note = "none", "no audio"
