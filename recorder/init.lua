@@ -12,13 +12,14 @@
 -- Audio (in order of preference):
 --   "loopback" Windows 10 2004+: bin/loopback.exe records exactly what this
 --              process plays (WASAPI process loopback, like OBS Application
---              Audio Capture). Every frame's wall-clock time is logged, and
---              on stop the capture is warped onto the video clock, so it
---              stays in sync even where the game fell behind real time.
+--              Audio Capture), 48 kHz float. The capture is used untouched,
+--              placed by the time stamp of its first sample. It stays in sync
+--              as long as the game keeps real time while recording, which a
+--              hardware encoder makes easy; the result notes any lag.
 --   "events"   every love.audio Source is tracked (play / stop / pause /
 --              seek / volume / pitch / looping / master volume) and the same
 --              files are re-mixed on the video clock (only file-based
---              sources). Also used to measure the loopback latency.
+--              sources). Used when loopback isn't available.
 --   "auto"     loopback when available, events otherwise (default).
 -- Needs ffmpeg on PATH (or config.ffmpeg / the FFMPEG environment variable).
 -- MIT License.
@@ -32,8 +33,9 @@ R.config = {
     fps = 60,
     audio = "auto",          -- "auto" | "loopback" | "events" | "none"
     ffmpeg = os.getenv("FFMPEG") or "ffmpeg",
-    encoder = "libx264",     -- "libx264" | "auto" (first working of h264_nvenc / h264_amf /
-                             -- h264_qsv, else libx264) | an encoder name
+    encoder = "auto",        -- "auto" (first working of h264_nvenc / h264_amf / h264_qsv,
+                             -- else libx264) | "libx264" | an encoder name. A GPU
+                             -- encoder keeps the game at real time while recording
     crf = 18,                -- libx264 quality (hardware encoders use their own equivalents)
     preset = "veryfast",
     outDir = "recordings",   -- inside the save directory
@@ -41,14 +43,12 @@ R.config = {
     trackAudio = true,       -- track Sources for the "events" fallback
     pace = true,             -- never run faster than real time while recording
     overlay = true,          -- attach(): small REC status in the window
-    latency = 0.09,          -- loopback output latency (s) used when it can't be measured
 }
 
 R.active, R.busy, R.message = false, false, nil
 
 local thread, inCh, outCh
 local frame, startQpc, startTime = 0, 0, 0
-local frameWall = {}     -- wall-clock seconds (from start) at which each frame was captured
 local lbWav, lbExe
 
 ------------------------------------------------------------
@@ -238,8 +238,10 @@ local function loopbackExe()
     local data = love.filesystem.read(DIR .. "/bin/loopback.exe")
     if not data then return nil end
     love.filesystem.createDirectory("recorder_bin")
-    local info = love.filesystem.getInfo("recorder_bin/loopback.exe")
-    if not info or info.size ~= #data then love.filesystem.write("recorder_bin/loopback.exe", data) end
+    -- refresh the copy whenever its bytes differ (a rebuild can keep the size)
+    if love.filesystem.read("recorder_bin/loopback.exe") ~= data then
+        love.filesystem.write("recorder_bin/loopback.exe", data)
+    end
     lbExe = (love.filesystem.getSaveDirectory() .. "/recorder_bin/loopback.exe"):gsub("/", "\\")
     return lbExe
 end
@@ -266,10 +268,18 @@ function R.start(canvas, name)
     thread = love.thread.newThread(DIR .. "/worker.lua")
     thread:start()
     inCh:push({ dir = dir, name = name, w = w, h = h, fps = cfg.fps, ffmpeg = cfg.ffmpeg,
-                crf = cfg.crf, preset = cfg.preset, encoder = cfg.encoder, latency = cfg.latency,
-                driftWindow = cfg.driftWindow })
+                crf = cfg.crf, preset = cfg.preset, encoder = R.encoder or cfg.encoder,
+                keepAudio = cfg.keepAudio })
+    -- wait until the encoder is up (the first "auto" probe takes a moment),
+    -- then start the clock
+    local ready = outCh:demand(30)
+    if not ready or not ready:match("^ready") then
+        R.message = ready or "error|encoder did not start"
+        return false
+    end
+    R.encoder = ready:match("^ready|(.+)$")   -- the probe result, reused next time
 
-    frame, events, frameWall = 0, {}, {}
+    frame, events = 0, {}
     R.active, R.message = true, nil
     openPlaying()
     startQpc, startTime = qpcNow(), love.timer.getTime()
@@ -304,7 +314,6 @@ function R.capture(canvas)
     -- handle right away: the GC can't see the 8 MB behind each ImageData, so
     -- leaving it to the collector piles up gigabytes on a long recording.
     local img = canvas:newImageData()
-    frameWall[frame + 1] = string.format("%.5f", qpcNow() - startQpc)
     inCh:supply(img)
     img:release()
     frame = frame + 1
@@ -328,8 +337,7 @@ function R.stop(wait)
         lines[#lines + 1] = table.concat({ ev.path, ev.t0, ev.t1, ev.pitch, ev.vol,
             ev.loop and 1 or 0, ev.offset }, "\t")
     end
-    msg.events = table.concat(lines, "\n")   -- also used to measure loopback latency
-    msg.frameWall = table.concat(frameWall, ",")
+    msg.events = table.concat(lines, "\n")
     msg.drift = drift
     if lbWav then
         msg.audio, msg.wav = "loopback", lbWav:gsub("\\", "/")

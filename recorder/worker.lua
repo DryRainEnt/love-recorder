@@ -8,11 +8,8 @@
 -- either the loopback WAV or a re-mix of the tracked Source events on the
 -- video clock, then ffmpeg muxes video + audio.
 --
--- Loopback alignment: loopback.exe stamps the QPC time of its first sample,
--- which places the track on the video clock; what remains is the output
--- latency (a sound reaches the device ~50-150 ms after play()). When tracked
--- events exist, that latency is measured by cross-correlating the loopback
--- envelope with the event re-mix and removed; otherwise cfg.latency is used.
+-- Loopback: loopback.exe stamps the QPC time of its first sample, which
+-- places the track on the video clock. Nothing else is done to it.
 ------------------------------------------------------------
 require("love.image")
 require("love.sound")
@@ -56,6 +53,9 @@ local pipe = io.popen(sh(q(cfg.ffmpeg) ..
     " -y -loglevel error -f rawvideo -pix_fmt rgba -s " .. cfg.w .. "x" .. cfg.h ..
     " -r " .. cfg.fps .. " -i - -pix_fmt yuv420p " .. vargs .. " " .. q(videoPath)), isWin and "wb" or "w")
 if not pipe then outCh:push("error|ffmpeg could not be started (" .. cfg.ffmpeg .. ")"); return end
+-- the caller starts its clock only now, so encoder probing / ffmpeg start-up
+-- never counts as lag
+outCh:push("ready|" .. encoder)
 
 local frames, stop = 0, nil
 while true do
@@ -142,137 +142,6 @@ local function writeWav(path, mix, total)
     f:close()
 end
 
--- 1 ms envelope (mean |L|+|R|) of a stereo float mix
-local function envFromMix(mix, total)
-    local n = math.floor(total / 44.1)
-    local env = ffi.new("double[?]", n + 1)
-    for k = 0, n - 1 do
-        local a, b, s = math.floor(k * 44.1), math.floor((k + 1) * 44.1), 0
-        for i = a, b - 1 do s = s + math.abs(mix[i * 2]) + math.abs(mix[i * 2 + 1]) end
-        env[k] = s / math.max(1, b - a)
-    end
-    return env, n
-end
-
--- 1 ms envelope of the loopback WAV (16-bit stereo PCM written by loopback.exe)
-local function envFromWav(path)
-    local f = io.open(path, "rb")
-    if not f then return nil end
-    local data = f:read("*a")
-    f:close()
-    local bytes = #data - 44
-    if bytes <= 0 then return nil end
-    local ptr = ffi.cast("const int16_t*", ffi.cast("const char*", data) + 44)
-    local frames = math.floor(bytes / 4)
-    local n = math.floor(frames / 44.1)
-    local env = ffi.new("double[?]", n + 1)
-    for k = 0, n - 1 do
-        local a, b, s = math.floor(k * 44.1), math.floor((k + 1) * 44.1), 0
-        for i = a, b - 1 do s = s + math.abs(ptr[i * 2]) + math.abs(ptr[i * 2 + 1]) end
-        env[k] = s / math.max(1, b - a) / 32768
-    end
-    return env, n, data   -- keep data alive while env is used
-end
-
-------------------------------------------------------------
--- Video clock -> wall clock
-------------------------------------------------------------
--- Each frame's capture time jitters by milliseconds (pacing sleeps, GPU
--- readback); following that frame by frame would wobble the pitch every
--- 16 ms. Only the slow trend matters: the drift (wall - video) is averaged
--- over DRIFT_WINDOW seconds. If it never moves more than STEADY from its
--- median, the game kept real time: the capture is just shifted, sample for
--- sample, untouched. Otherwise the smoothed drift is followed, so stretches
--- where the game fell behind are eased back onto their frames.
-local DRIFT_WINDOW, STEADY = cfg.driftWindow or 1.0, 0.03
-local wall, wallN = {}, 0
-for v in (stop.frameWall or ""):gmatch("[^,]+") do wallN = wallN + 1; wall[wallN] = tonumber(v) end
-local drift, steady, shift = {}, true, 0
-if wallN >= 2 then
-    local raw, sorted = {}, {}
-    for i = 1, wallN do raw[i] = wall[i] - (i - 1) / cfg.fps; sorted[i] = raw[i] end
-    table.sort(sorted)
-    shift = sorted[math.floor(wallN / 2) + 1]
-    local k = math.max(1, math.floor(DRIFT_WINDOW * cfg.fps / 2))
-    local pre = { [0] = 0 }
-    for i = 1, wallN do pre[i] = pre[i - 1] + raw[i] end
-    for i = 1, wallN do
-        local a, b = math.max(1, i - k), math.min(wallN, i + k)
-        drift[i] = (pre[b] - pre[a - 1]) / (b - a + 1)
-        if math.abs(drift[i] - shift) > STEADY then steady = false end
-    end
-end
-local function wallAt(tv)
-    if steady or wallN < 2 then return tv + shift end
-    local f = tv * cfg.fps
-    local i = math.floor(f)
-    if i < 0 then return tv + drift[1] end
-    if i >= wallN - 1 then return tv + drift[wallN] end
-    local a = drift[i + 1]
-    return tv + a + (drift[i + 2] - a) * (f - i)
-end
-
--- best latency (ms, 0..maxLag): loopback ms index for video ms k is
--- base[k] + lat; compared every `step` ms
-local function measureLatency(evEnv, evN, lbEnv, lbN, base, maxLag, step)
-    local function mean(e, n) local s = 0 for i = 0, n - 1 do s = s + e[i] end return s / math.max(1, n) end
-    local me, ml = mean(evEnv, evN), mean(lbEnv, lbN)
-    local best, bestLat = -1e9, 0
-    local ve = 0
-    for k = 0, evN - 1, step do ve = ve + (evEnv[k] - me) ^ 2 end
-    local bestNorm = 0
-    for lat = 0, maxLag do
-        local s, vl = 0, 0
-        for k = 0, evN - 1, step do
-            local j = base[k] + lat
-            if j >= 0 and j < lbN then
-                local d = lbEnv[j] - ml
-                s = s + (evEnv[k] - me) * d
-                vl = vl + d * d
-            end
-        end
-        if s > best then
-            best, bestLat = s, lat
-            bestNorm = (ve > 0 and vl > 0) and s / math.sqrt(ve * vl) or 0
-        end
-    end
-    return bestLat, bestNorm
-end
-
--- The loopback capture resampled onto the video clock: output sample at
--- video time t reads the capture at wall time wallAt(t) + latency. Where the
--- game kept real time this is a plain shift; where it fell behind, that
--- stretch of audio is squeezed back to the frames it belongs to.
-local function warpLoopback(data, offset0, latency)
-    local bytes = #data - 44
-    local src = ffi.cast("const int16_t*", ffi.cast("const char*", data) + 44)
-    local srcN = math.floor(bytes / 4)
-    local total = math.max(1, math.floor(duration * RATE))
-    local out = ffi.new("float[?]", total * 2)
-    if steady then
-        -- kept real time: a plain sample-exact shift, no resampling
-        local d = math.floor((shift + latency - offset0) * RATE + 0.5)
-        for o = 0, total - 1 do
-            local i = o + d
-            if i >= 0 and i < srcN then
-                out[o * 2] = src[i * 2] / 32768
-                out[o * 2 + 1] = src[i * 2 + 1] / 32768
-            end
-        end
-        return out, total
-    end
-    for o = 0, total - 1 do
-        local p = (wallAt(o / RATE) + latency - offset0) * RATE
-        local i0 = math.floor(p)
-        if i0 >= 0 and i0 + 1 < srcN then
-            local fr = p - i0
-            out[o * 2] = (src[i0 * 2] * (1 - fr) + src[i0 * 2 + 2] * fr) / 32768
-            out[o * 2 + 1] = (src[i0 * 2 + 1] * (1 - fr) + src[i0 * 2 + 3] * fr) / 32768
-        end
-    end
-    return out, total
-end
-
 ------------------------------------------------------------
 -- Audio
 ------------------------------------------------------------
@@ -288,30 +157,22 @@ local function waitStart(wav)
 end
 
 if stop.audio == "loopback" then
+    -- The capture is used exactly as recorded: placed on the video clock by
+    -- the QPC stamp of its first sample, never resampled or re-timed. If the
+    -- game fell behind real time while recording, the note says by how much
+    -- (that much audio drift by the end of the clip).
     local lbStart = waitStart(stop.wav)
     if lbStart and exists(stop.wav) then
-        local offset0 = lbStart - stop.startQpc       -- first sample, wall clock from start
-        local latency, how = cfg.latency or 0.09, "default"
-        local lbEnv, lbN, data = envFromWav(stop.wav)
-        local mix, total = buildMix(stop.events)
-        if mix and lbEnv then
-            local evEnv, evN = envFromMix(mix, total)
-            local base = ffi.new("int32_t[?]", evN + 1)
-            for k = 0, evN - 1 do base[k] = math.floor((wallAt(k / 1000) - offset0) * 1000 + 0.5) end
-            local lat, corr = measureLatency(evEnv, evN, lbEnv, lbN, base, 400, 2)
-            if corr >= 0.5 then latency, how = lat / 1000, string.format("measured, r=%.2f", corr) end
-        end
-        if data then
-            local out, outN = warpLoopback(data, offset0, latency)
-            audioPath = cfg.dir .. "/" .. cfg.name .. "_synced.wav"
-            writeWav(audioPath, out, outN)
-            audioFilter = "apad"
-            note = string.format("loopback %s (wall %+.2f s), latency %d ms (%s)",
-                steady and "shifted" or "warped", stop.drift or 0, math.floor(latency * 1000 + 0.5), how)
+        audioPath = stop.wav
+        local offset = lbStart - stop.startQpc
+        if offset >= 0 then
+            audioFilter = string.format("adelay=%d:all=1,apad", math.floor(offset * 1000 + 0.5))
         else
-            note = "loopback empty, no audio"
+            audioFilter = string.format("atrim=start=%.4f,asetpts=PTS-STARTPTS,apad", -offset)
         end
-        if not cfg.keepAudio then os.remove(stop.wav); os.remove(stop.wav .. ".start") end
+        local drift = stop.drift or 0
+        note = "loopback" .. (math.abs(drift) > 0.05 and
+            string.format(" (WARNING: recording ran %.2f s behind real time)", drift) or "")
     else
         note = "loopback failed, no audio"
     end

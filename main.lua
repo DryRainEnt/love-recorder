@@ -9,14 +9,14 @@ local recorder = require("recorder")
 
 local balls, blip, hum = {}, nil, nil
 local t = 0
-local selftest, selfAudio, slow, encoder, window
+local selftest, selfAudio, slow, encoder, keep
 
 function love.load(args)
     for i, a in ipairs(args or {}) do
         if a == "--selftest" then selftest = true; selfAudio = args[i + 1] end
         if a == "--slow" then slow = true end
         if a == "--encoder" then encoder = args[i + 1] end
-        if a == "--window" then window = tonumber(args[i + 1]) end
+        if a == "--keep" then keep = true end
     end
     love.graphics.setBackgroundColor(0.08, 0.09, 0.16)
     blip = love.audio.newSource("example/sounds/blip.wav", "static")
@@ -28,7 +28,7 @@ function love.load(args)
         balls[i] = { x = 100 + i * 90, y = 80 + i * 30, vx = 220 + i * 25, vy = 0, r = 14 + i * 2,
                      c = { 0.4 + i * 0.1, 0.8 - i * 0.08, 1 } }
     end
-    recorder.attach({ audio = selfAudio or "auto", encoder = encoder, driftWindow = window })
+    recorder.attach({ audio = selfAudio or "auto", encoder = encoder, keepAudio = keep })
     if selftest then recorder.start(love.graphics.newCanvas(love.graphics.getDimensions()), "selftest") end
 end
 
@@ -48,7 +48,7 @@ function love.update(dt)
     end
     -- exercise the tracker: master volume and hum pitch change mid-clip
     if t > 1.5 and t - dt <= 1.5 then love.audio.setVolume(0.6); hum:setPitch(1.25) end
-    if selftest and recorder.active and recorder.time() >= 3 then
+    if selftest and recorder.active and recorder.time() >= (keep and 20 or 3) then
         local res = recorder.stop(true)
         print(res)
         love.filesystem.write("selftest_result.txt", tostring(res))

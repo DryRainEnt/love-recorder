@@ -3,8 +3,11 @@
 //   loopback.exe <pid> <out.wav>
 //
 // Uses WASAPI process loopback (Windows 10 2004+ / build 19041+), the same
-// API as OBS "Application Audio Capture". Records 44.1 kHz 16-bit stereo PCM
-// until a line (or EOF) arrives on stdin, then finalises the WAV.
+// API as OBS "Application Audio Capture". Records 48 kHz 32-bit float stereo
+// (the Windows mix format, so normally no conversion at all; when the device
+// runs at another rate the engine converts with its high-quality resampler)
+// until a line arrives on stdin or <out.wav>.stop appears, then finalises
+// the WAV.
 //
 // Next to the WAV it writes <out.wav>.start containing the QueryPerformance-
 // Counter time (seconds) of the first recorded sample, so a caller can line
@@ -29,7 +32,7 @@
 
 using namespace Microsoft::WRL;
 
-static const int RATE = 44100, CHANNELS = 2, BYTES_PER_FRAME = 4;
+static const int RATE = 48000, CHANNELS = 2, BYTES_PER_FRAME = 8;   // float32 stereo
 
 class ActivateHandler : public RuntimeClass<RuntimeClassFlags<ClassicCom>, FtmBase,
                                              IActivateAudioInterfaceCompletionHandler> {
@@ -66,8 +69,8 @@ static void WriteU16(FILE* f, uint16_t v) { fwrite(&v, 2, 1, f); }
 static void WriteHeader(FILE* f, uint32_t dataBytes) {
     fseek(f, 0, SEEK_SET);
     fwrite("RIFF", 1, 4, f); WriteU32(f, 36 + dataBytes); fwrite("WAVE", 1, 4, f);
-    fwrite("fmt ", 1, 4, f); WriteU32(f, 16); WriteU16(f, 1); WriteU16(f, CHANNELS);
-    WriteU32(f, RATE); WriteU32(f, RATE * BYTES_PER_FRAME); WriteU16(f, BYTES_PER_FRAME); WriteU16(f, 16);
+    fwrite("fmt ", 1, 4, f); WriteU32(f, 16); WriteU16(f, 3 /* IEEE float */); WriteU16(f, CHANNELS);
+    WriteU32(f, RATE); WriteU32(f, RATE * BYTES_PER_FRAME); WriteU16(f, BYTES_PER_FRAME); WriteU16(f, 32);
     fwrite("data", 1, 4, f); WriteU32(f, dataBytes);
 }
 
@@ -99,15 +102,15 @@ int wmain(int argc, wchar_t** argv) {
     ComPtr<IAudioClient> client = handler->client;
 
     WAVEFORMATEX fmt = {};
-    fmt.wFormatTag = WAVE_FORMAT_PCM;
+    fmt.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
     fmt.nChannels = CHANNELS;
     fmt.nSamplesPerSec = RATE;
-    fmt.wBitsPerSample = 16;
+    fmt.wBitsPerSample = 32;
     fmt.nBlockAlign = BYTES_PER_FRAME;
     fmt.nAvgBytesPerSec = RATE * BYTES_PER_FRAME;
     hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED,
                             AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK |
-                            AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+                            AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
                             200000, 0, &fmt, nullptr);
     if (FAILED(hr)) { fwprintf(stderr, L"initialize failed 0x%08x\n", hr); return 1; }
     HANDLE ready = CreateEventW(nullptr, FALSE, FALSE, nullptr);
